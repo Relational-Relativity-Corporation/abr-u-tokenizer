@@ -1,26 +1,36 @@
 // abr-u-tokenizer  lib.rs
-// V0.1.0 — U tokenizer for Phi-3
+// V0.1.1 — U tokenizer for Phi-3
 // Origin: Robin Macomber / Metatron Dynamics
-// OOV handling: Option A (character-by-character, no information loss)
 //
-// TOKEN DOMAIN: D_U = 5,844 U units derived from strict local minima of Q(S)
-// across 317,070 bounded structures in the abr-language-analysis corpus.
-// Every token boundary has declared provenance from character participation
-// patterns — NOT statistical compression.
+// COMPLETE TILING (Origin-declared):
+//   Every character in the input stream tiles into the output.
+//   No character is discarded. No position is fabricated.
+//   Spaces and all characters are treated identically to their
+//   treatment in the relational processing — as observed characters
+//   in the stream, tiling as codepoint tokens when they have no
+//   full P1/P2 coverage.
 //
-// OOV RULE (Origin-declared):
-//   If a character sequence has no P2 data and thus no Q(S) values,
-//   emit each character as its own token (character-level fallback).
-//   No information is lost.
+// TOKEN DOMAIN:
+//   0 .. (u_unit_count-1)  — U unit tokens, derived from strict local
+//                            minima of Q(S) across 317,070 bounded
+//                            structures. Every boundary has declared
+//                            provenance from character participation
+//                            patterns — NOT statistical compression.
+//   u_unit_count+          — codepoint tokens: ID = u_unit_count + codepoint
+//                            No gap, no phantom [CHAR] marker.
 //
-// SPECIAL TOKEN IDs:
-//   0 .. 5843  — U unit tokens (indexed from vocab file)
-//   5844       — [CHAR] prefix marker for OOV character tokens
-//   5845+      — individual ASCII/UTF-8 code points mapped to token IDs
-//               via: 5845 + (codepoint as u32)
+// DECODE ROUNDTRIP INVARIANT (Verifier-required):
+//   decode(encode(S)) == S  for all S, including spaces and all characters.
 //
-// This scheme keeps U unit IDs and character fallback IDs disjoint
-// with no UNK collision.
+// VERIFIER CORRECTIONS FROM V0.1.0:
+//   F1 — Missing P1 or P2 now triggers full character-by-character tiling
+//        of the bounded structure BEFORE Q(S) is computed. Absence of
+//        observation is never substituted with 0.0.
+//   F2 — Input is processed as a flat character stream. Spaces tile as
+//        codepoint tokens, identical to all other characters. No whitespace
+//        splitting discards dividers.
+//   F3 — [CHAR] phantom marker removed. Codepoint path is the sole and
+//        complete OOV representation. ID scheme is contiguous.
 
 use std::collections::HashMap;
 
@@ -31,11 +41,11 @@ use std::collections::HashMap;
 /// The complete declared vocabulary derived from abr-language-analysis.
 #[derive(Debug, Clone)]
 pub struct UVocabulary {
-    /// U unit string → token ID (0..5843)
+    /// U unit string → token ID (0..u_unit_count-1)
     pub unit_to_id: HashMap<String, u32>,
     /// token ID → U unit string
     pub id_to_unit: HashMap<u32, String>,
-    /// Number of U unit tokens (5,844)
+    /// Number of U unit tokens (5,844 from declared corpus)
     pub u_unit_count: u32,
 }
 
@@ -47,9 +57,8 @@ impl UVocabulary {
     /// OR simpler:
     ///   <unit_string>\t<count>
     ///
-    /// This parser handles both. The integer ID is assigned by sorted
-    /// index position, not by the rank column, so the mapping is
-    /// deterministic regardless of file ordering.
+    /// ID assignment is by sorted lexicographic index — deterministic
+    /// regardless of file ordering.
     pub fn from_index_file(contents: &str) -> Result<Self, String> {
         let mut units: Vec<(String, u64)> = Vec::new();
 
@@ -59,20 +68,15 @@ impl UVocabulary {
                 continue;
             }
             let parts: Vec<&str> = line.split('\t').collect();
-            // Accept layouts with 2+ columns; unit string is always
-            // the first non-numeric column.
             let (unit, count) = match parts.len() {
                 0 | 1 => {
                     return Err(format!("line {}: too few columns", line_num + 1));
                 }
                 2 => {
-                    // unit \t count
                     let count = parts[1].parse::<u64>().unwrap_or(1);
                     (parts[0].to_string(), count)
                 }
                 _ => {
-                    // rank \t unit \t count \t ...
-                    // Detect: if parts[0] parses as integer, skip it
                     if parts[0].parse::<u64>().is_ok() {
                         let count = parts[2].parse::<u64>().unwrap_or(1);
                         (parts[1].to_string(), count)
@@ -89,7 +93,6 @@ impl UVocabulary {
             return Err("No U units found in index file".to_string());
         }
 
-        // Sort lexicographically so ID assignment is deterministic
         units.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut unit_to_id = HashMap::new();
@@ -111,72 +114,95 @@ impl UVocabulary {
     }
 
     /// Decode a token ID back to its string representation.
+    /// IDs 0..u_unit_count-1 → U unit string.
+    /// IDs u_unit_count+     → codepoint: id - u_unit_count = codepoint.
     pub fn decode_id(&self, id: u32) -> String {
         if id < self.u_unit_count {
             self.id_to_unit
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| format!("[UNK:{}]", id))
-        } else if id == self.u_unit_count {
-            "[CHAR]".to_string()
         } else {
-            // OOV character: id = u_unit_count + 1 + codepoint
-            let cp = id - self.u_unit_count - 1;
+            // Codepoint token: id = u_unit_count + codepoint
+            let cp = id - self.u_unit_count;
             char::from_u32(cp)
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| format!("[CP:{}]", cp))
         }
     }
 
-    /// Encode a single character as an OOV token ID (Option A).
-    pub fn char_to_oov_id(&self, c: char) -> u32 {
-        self.u_unit_count + 1 + (c as u32)
+    /// Encode a single character as a codepoint token ID.
+    /// ID = u_unit_count + (codepoint as u32).
+    /// Contiguous with U unit IDs, no gap.
+    pub fn char_to_codepoint_id(&self, c: char) -> u32 {
+        self.u_unit_count + (c as u32)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARTICIPATION COVERAGE CHECK
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Check whether a bounded structure has complete P1 and P2 coverage
+/// for all positions required by the declared Q(S) formula:
+///   Q(S)[i] = P1[c_i] + P2[c_{i+1}]   for i in 0..len-1
+///
+/// Required observations:
+///   P1 for every character at position 0..len-1
+///   P2 for every character at position 1..len
+///
+/// Returns true only if ALL required observations are present.
+/// Absence of observation is NEVER substituted with 0.0.
+pub fn has_complete_coverage(
+    chars: &[char],
+    p1: &HashMap<char, f64>,
+    p2: &HashMap<char, f64>,
+) -> bool {
+    if chars.len() < 2 {
+        return false; // cannot compute Q(S) for single char or empty
+    }
+    for i in 0..chars.len() - 1 {
+        if !p1.contains_key(&chars[i]) {
+            return false;
+        }
+        if !p2.contains_key(&chars[i + 1]) {
+            return false;
+        }
+    }
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Q(S) COMPUTATION
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Participation frequencies for a character position.
-/// P1 = frequency of this char as position 1 in any bounded structure.
-/// P2 = frequency of this char as position 2.
-/// (Extended to P1..P6 in the full corpus; we use P1+P2 for boundary signal.)
-#[derive(Debug, Clone)]
-pub struct ParticipationProfile {
-    pub p1: f64,
-    pub p2: f64,
-}
-
-/// Q(S) participation signal for a bounded structure S = c_0 c_1 ... c_n.
+/// Q(S) participation signal for a bounded structure with COMPLETE coverage.
 ///
-/// Per the declared formula from abr-language-analysis:
-///   Q(S)[i] = P1[c_i] + P2[c_{i+1}]   for i in 0..len-1
+/// PRECONDITION: has_complete_coverage(chars, p1, p2) == true.
+/// Call site is responsible for this check. No unwrap_or substitution here.
 ///
-/// Local minima of Q(S) at interior positions (1..len-2) are U boundaries.
+/// Q(S)[i] = P1[c_i] + P2[c_{i+1}]   for i in 0..len-1
 pub fn compute_q(
     chars: &[char],
     p1: &HashMap<char, f64>,
     p2: &HashMap<char, f64>,
 ) -> Vec<f64> {
     let n = chars.len();
-    if n < 2 {
-        return vec![];
-    }
+    debug_assert!(n >= 2, "compute_q called on structure with < 2 chars");
     let mut q = Vec::with_capacity(n - 1);
     for i in 0..n - 1 {
-        let p1_i = p1.get(&chars[i]).copied().unwrap_or(0.0);
-        let p2_next = p2.get(&chars[i + 1]).copied().unwrap_or(0.0);
+        // Both lookups are guaranteed present by has_complete_coverage.
+        // Panic here is correct — it means the precondition was violated.
+        let p1_i    = *p1.get(&chars[i]).expect("P1 missing — precondition violated");
+        let p2_next = *p2.get(&chars[i + 1]).expect("P2 missing — precondition violated");
         q.push(p1_i + p2_next);
     }
     q
 }
 
 /// Find interior local minima of Q(S).
-/// Position i (1-indexed in Q) is a boundary iff:
-///   Q[i] < Q[i-1]  AND  Q[i] < Q[i+1]
-/// Returns the set of boundary indices in the original char array
-/// (position after which to split).
+/// Position i is a boundary iff Q[i] < Q[i-1] AND Q[i] < Q[i+1].
+/// Returns split positions in the original char array.
 pub fn find_u_boundaries(q: &[f64]) -> Vec<usize> {
     let mut boundaries = Vec::new();
     if q.len() < 3 {
@@ -184,8 +210,7 @@ pub fn find_u_boundaries(q: &[f64]) -> Vec<usize> {
     }
     for i in 1..q.len() - 1 {
         if q[i] < q[i - 1] && q[i] < q[i + 1] {
-            // boundary falls between char[i] and char[i+1]
-            boundaries.push(i + 1); // split position in chars
+            boundaries.push(i + 1);
         }
     }
     boundaries
@@ -199,9 +224,9 @@ pub fn find_u_boundaries(q: &[f64]) -> Vec<usize> {
 /// Holds vocabulary + participation tables derived from the corpus.
 pub struct UTokenizer {
     pub vocab: UVocabulary,
-    /// P1 table: char → frequency as position-1 in bounded structures
+    /// P1 table: char → observed frequency as position-1
     pub p1: HashMap<char, f64>,
-    /// P2 table: char → frequency as position-2 in bounded structures
+    /// P2 table: char → observed frequency as position-2
     pub p2: HashMap<char, f64>,
 }
 
@@ -214,48 +239,97 @@ impl UTokenizer {
         UTokenizer { vocab, p1, p2 }
     }
 
-    /// Tokenize a raw text string.
+    /// Encode a bounded structure (a word — characters only, no spaces).
     ///
     /// Process:
-    ///   1. Split input into whitespace-delimited words (bounded structures).
-    ///   2. For each word:
-    ///      a. Compute Q(S) over its characters.
-    ///      b. Find interior local minima → U boundaries.
-    ///      c. Partition at boundaries → candidate U units.
-    ///      d. For each candidate:
-    ///         - If found in vocab → emit its ID.
-    ///         - Else (OOV, Option A) → emit each character as its own token.
-    ///   3. Return flat Vec<u32> of token IDs.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        let mut ids = Vec::new();
+    ///   1. Check complete P1/P2 coverage for all positions.
+    ///   2. If coverage is incomplete → tile character-by-character.
+    ///      Q(S) is NOT computed. No fabricated zeros.
+    ///   3. If coverage is complete → compute Q(S), find strict interior
+    ///      local minima, partition into candidate U units.
+    ///   4. For each candidate:
+    ///      - Known U unit → emit its ID.
+    ///      - Unknown → tile character-by-character (codepoint tokens).
+    fn encode_structure(&self, chars: &[char], out: &mut Vec<u32>) {
+        if chars.is_empty() {
+            return;
+        }
 
-        for word in text.split_whitespace() {
-            let chars: Vec<char> = word.chars().collect();
+        // Single character: tile directly, no Q(S) possible
+        if chars.len() == 1 {
+            out.push(self.vocab.char_to_codepoint_id(chars[0]));
+            return;
+        }
 
-            // Compute Q(S) and find boundaries
-            let q = compute_q(&chars, &self.p1, &self.p2);
-            let boundaries = find_u_boundaries(&q);
+        // F1 FIX: check coverage BEFORE computing Q(S).
+        // Missing P1 or P2 → tile entire structure character-by-character.
+        if !has_complete_coverage(chars, &self.p1, &self.p2) {
+            for &c in chars {
+                out.push(self.vocab.char_to_codepoint_id(c));
+            }
+            return;
+        }
 
-            // Partition chars at boundaries into segments
-            let segments = partition_at_boundaries(&chars, &boundaries);
+        // Coverage confirmed — compute Q(S) and find boundaries
+        let q = compute_q(chars, &self.p1, &self.p2);
+        let boundaries = find_u_boundaries(&q);
+        let segments = partition_at_boundaries(chars, &boundaries);
 
-            for seg in &segments {
-                let seg_str: String = seg.iter().collect();
-                if let Some(&id) = self.vocab.unit_to_id.get(&seg_str) {
-                    ids.push(id);
-                } else {
-                    // OOV Option A: emit character by character
-                    for &c in seg.iter() {
-                        ids.push(self.vocab.char_to_oov_id(c));
-                    }
+        for seg in &segments {
+            let seg_str: String = seg.iter().collect();
+            if let Some(&id) = self.vocab.unit_to_id.get(&seg_str) {
+                out.push(id);
+            } else {
+                // Unknown candidate U unit → character-by-character
+                for &c in seg.iter() {
+                    out.push(self.vocab.char_to_codepoint_id(c));
                 }
             }
+        }
+    }
+
+    /// Tokenize a raw text string.
+    ///
+    /// COMPLETE TILING: every character in the input tiles into the output.
+    /// Spaces and all characters are observed stream members — they tile
+    /// as codepoint tokens, consistent with their treatment in the
+    /// relational processing.
+    ///
+    /// Process:
+    ///   Walk the input character by character.
+    ///   Accumulate runs of non-space characters as bounded structures.
+    ///   On space (or any whitespace): flush the accumulated structure,
+    ///   then emit the space as its own codepoint token.
+    ///   At end of input: flush any remaining structure.
+    ///
+    /// DECODE ROUNDTRIP: decode(encode(S)) == S for all S.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut current: Vec<char> = Vec::new();
+
+        for c in text.chars() {
+            if c.is_whitespace() {
+                // Flush accumulated bounded structure
+                if !current.is_empty() {
+                    self.encode_structure(&current, &mut ids);
+                    current.clear();
+                }
+                // Tile the space/whitespace character itself
+                ids.push(self.vocab.char_to_codepoint_id(c));
+            } else {
+                current.push(c);
+            }
+        }
+        // Flush final structure
+        if !current.is_empty() {
+            self.encode_structure(&current, &mut ids);
         }
 
         ids
     }
 
-    /// Decode a sequence of token IDs back to a string.
+    /// Decode a sequence of token IDs back to the original string.
+    /// Roundtrip invariant: decode(encode(S)) == S.
     pub fn decode(&self, ids: &[u32]) -> String {
         ids.iter()
             .map(|&id| self.vocab.decode_id(id))
@@ -263,28 +337,49 @@ impl UTokenizer {
             .join("")
     }
 
-    /// Tokenize and return the string segments (before ID lookup).
-    /// Useful for inspection and Verifier review.
+    /// Tokenize and return string segments for inspection and Verifier review.
+    /// Spaces appear as their literal character in the segment list.
     pub fn tokenize_to_strings(&self, text: &str) -> Vec<String> {
         let mut segments = Vec::new();
+        let mut current: Vec<char> = Vec::new();
 
-        for word in text.split_whitespace() {
-            let chars: Vec<char> = word.chars().collect();
-            let q = compute_q(&chars, &self.p1, &self.p2);
+        let flush = |chars: &[char], segments: &mut Vec<String>, tok: &UTokenizer| {
+            if chars.is_empty() { return; }
+            if chars.len() == 1 {
+                segments.push(format!("[CP:{}]", chars[0]));
+                return;
+            }
+            if !has_complete_coverage(chars, &tok.p1, &tok.p2) {
+                for &c in chars {
+                    segments.push(format!("[CP:{}]", c));
+                }
+                return;
+            }
+            let q = compute_q(chars, &tok.p1, &tok.p2);
             let boundaries = find_u_boundaries(&q);
-            let segs = partition_at_boundaries(&chars, &boundaries);
+            let segs = partition_at_boundaries(chars, &boundaries);
             for seg in segs {
                 let s: String = seg.iter().collect();
-                if self.vocab.unit_to_id.contains_key(&s) {
+                if tok.vocab.unit_to_id.contains_key(&s) {
                     segments.push(s);
                 } else {
-                    // OOV: emit each character with [OOV] marker
                     for c in seg {
-                        segments.push(format!("[OOV:{}]", c));
+                        segments.push(format!("[CP:{}]", c));
                     }
                 }
             }
+        };
+
+        for c in text.chars() {
+            if c.is_whitespace() {
+                flush(&current, &mut segments, self);
+                current.clear();
+                segments.push(c.to_string()); // space as itself
+            } else {
+                current.push(c);
+            }
         }
+        flush(&current, &mut segments, self);
 
         segments
     }
@@ -301,11 +396,9 @@ fn partition_at_boundaries(chars: &[char], boundaries: &[usize]) -> Vec<Vec<char
             start = b;
         }
     }
-    // Final segment
     if start < chars.len() {
         segments.push(chars[start..].to_vec());
     }
-
     if segments.is_empty() && !chars.is_empty() {
         segments.push(chars.to_vec());
     }
@@ -355,7 +448,6 @@ mod tests {
     fn mock_p_tables() -> (HashMap<char, f64>, HashMap<char, f64>) {
         let mut p1 = HashMap::new();
         let mut p2 = HashMap::new();
-        // Give 'a' high P1 and 'b' low P2 → Q drops at ab boundary
         p1.insert('a', 0.9);
         p1.insert('b', 0.1);
         p1.insert('c', 0.5);
@@ -377,17 +469,17 @@ mod tests {
     }
 
     #[test]
-    fn test_oov_id_disjoint_from_u_ids() {
+    fn test_codepoint_id_disjoint_from_u_ids() {
         let vocab = mock_vocab();
-        let oov_id = vocab.char_to_oov_id('z');
-        assert!(oov_id >= vocab.u_unit_count + 1);
+        let cp_id = vocab.char_to_codepoint_id('z');
+        assert!(cp_id >= vocab.u_unit_count);
     }
 
     #[test]
-    fn test_decode_oov_roundtrip() {
+    fn test_decode_codepoint_roundtrip() {
         let vocab = mock_vocab();
         let c = 'z';
-        let id = vocab.char_to_oov_id(c);
+        let id = vocab.char_to_codepoint_id(c);
         let decoded = vocab.decode_id(id);
         assert_eq!(decoded, "z");
     }
@@ -408,15 +500,14 @@ mod tests {
 
     #[test]
     fn test_find_boundaries_local_minima() {
-        // Q = [1.0, 0.3, 0.8] → interior position 1 is a local min
         let q = vec![1.0, 0.3, 0.8];
         let b = find_u_boundaries(&q);
-        assert_eq!(b, vec![2]); // split after char index 1
+        assert_eq!(b, vec![2]);
     }
 
     #[test]
     fn test_no_boundary_short_word() {
-        let q = vec![0.5, 0.3]; // only 2 elements, no interior
+        let q = vec![0.5, 0.3];
         let b = find_u_boundaries(&q);
         assert!(b.is_empty());
     }
@@ -424,7 +515,7 @@ mod tests {
     #[test]
     fn test_partition_at_boundaries() {
         let chars: Vec<char> = "abcd".chars().collect();
-        let boundaries = vec![2]; // split: "ab" | "cd"
+        let boundaries = vec![2];
         let segs = partition_at_boundaries(&chars, &boundaries);
         assert_eq!(segs.len(), 2);
         let s0: String = segs[0].iter().collect();
@@ -438,7 +529,6 @@ mod tests {
         let vocab = mock_vocab();
         let (p1, p2) = mock_p_tables();
         let tok = UTokenizer::new(vocab.clone(), p1, p2);
-        // "ab" is in vocab — should encode to its ID
         let ids = tok.encode("ab");
         assert!(!ids.is_empty());
         let id = *ids.first().unwrap();
@@ -446,16 +536,81 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_oov_falls_back_to_chars() {
+    fn test_encode_missing_coverage_tiles_chars() {
+        // F1: "zz" has no P1/P2 data — must tile character-by-character
+        // WITHOUT computing Q(S)
         let vocab = mock_vocab();
         let (p1, p2) = mock_p_tables();
-        let tok = UTokenizer::new(vocab.clone(), p1.clone(), p2.clone());
-        // "zz" will not be in vocab — should emit 2 OOV char tokens
+        let tok = UTokenizer::new(vocab.clone(), p1, p2);
         let ids = tok.encode("zz");
         assert_eq!(ids.len(), 2);
         for &id in &ids {
-            assert!(id >= vocab.u_unit_count + 1);
+            assert!(id >= vocab.u_unit_count);
         }
+    }
+
+    #[test]
+    fn test_missing_p1_triggers_char_fallback() {
+        // F1: Q(S)[i] = P1[c_i] + P2[c_{i+1}]
+        // For "ba": needs P1['b'] (position 0). P1['b'] absent → char fallback.
+        // Note: for "ab", P1['b'] is NOT required — 'b' is only at position 1.
+        let vocab = mock_vocab();
+        let mut p1 = HashMap::new();
+        let mut p2 = HashMap::new();
+        // 'b' has no P1 entry; 'a' does
+        p1.insert('a', 0.9);
+        p2.insert('a', 0.1);
+        p2.insert('b', 0.05);
+        let tok = UTokenizer::new(vocab.clone(), p1, p2);
+        // "ba" — P1['b'] missing (position 0) → full char fallback, no Q(S)
+        let ids = tok.encode("ba");
+        assert_eq!(ids.len(), 2);
+        for &id in &ids {
+            assert!(id >= vocab.u_unit_count);
+        }
+    }
+
+    #[test]
+    fn test_missing_p2_triggers_char_fallback() {
+        // F1: structure where P2 is missing for a character
+        let vocab = mock_vocab();
+        let mut p1 = HashMap::new();
+        let mut p2 = HashMap::new();
+        p1.insert('a', 0.9);
+        p1.insert('b', 0.1);
+        p2.insert('a', 0.1);
+        // P2['b'] missing
+        let tok = UTokenizer::new(vocab.clone(), p1, p2);
+        // "ab" needs P2['b'] for Q[0] — absent → char fallback
+        let ids = tok.encode("ab");
+        assert_eq!(ids.len(), 2);
+        for &id in &ids {
+            assert!(id >= vocab.u_unit_count);
+        }
+    }
+
+    #[test]
+    fn test_space_tiles_as_codepoint() {
+        // F2: spaces must tile as codepoint tokens
+        let vocab = mock_vocab();
+        let (p1, p2) = mock_p_tables();
+        let tok = UTokenizer::new(vocab.clone(), p1, p2);
+        let ids = tok.encode("a b");
+        // space codepoint = 32, id = u_unit_count + 32
+        let space_id = vocab.char_to_codepoint_id(' ');
+        assert!(ids.contains(&space_id));
+    }
+
+    #[test]
+    fn test_decode_roundtrip_with_spaces() {
+        // F2: full roundtrip including spaces
+        let vocab = mock_vocab();
+        let (p1, p2) = mock_p_tables();
+        let tok = UTokenizer::new(vocab.clone(), p1, p2);
+        let text = "ab cd";
+        let ids = tok.encode(text);
+        let decoded = tok.decode(&ids);
+        assert_eq!(decoded, text);
     }
 
     #[test]
@@ -471,8 +626,6 @@ mod tests {
 
     #[test]
     fn test_vocab_size_matches_declared() {
-        // When built from real u_units_index.txt, should be 5,844
-        // Here we just confirm mock count is consistent
         let vocab = mock_vocab();
         assert_eq!(vocab.u_unit_count, vocab.id_to_unit.len() as u32);
     }
@@ -484,5 +637,43 @@ mod tests {
         assert!((table[&'a'] - 0.9).abs() < 1e-10);
         assert!((table[&'b'] - 0.3).abs() < 1e-10);
         assert!((table[&'c'] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_has_complete_coverage_true() {
+        let mut p1 = HashMap::new();
+        let mut p2 = HashMap::new();
+        p1.insert('a', 0.9);
+        p1.insert('b', 0.1);
+        p2.insert('a', 0.1);
+        p2.insert('b', 0.05);
+        let chars: Vec<char> = "ab".chars().collect();
+        assert!(has_complete_coverage(&chars, &p1, &p2));
+    }
+
+    #[test]
+    fn test_has_complete_coverage_false_missing_p2() {
+        let mut p1 = HashMap::new();
+        let mut p2 = HashMap::new();
+        p1.insert('a', 0.9);
+        p1.insert('b', 0.1);
+        p2.insert('a', 0.1);
+        // p2['b'] missing
+        let chars: Vec<char> = "ab".chars().collect();
+        assert!(!has_complete_coverage(&chars, &p1, &p2));
+    }
+
+    #[test]
+    fn test_has_complete_coverage_false_missing_p1() {
+        // For "ba": needs P1['b'] at position 0. P1['b'] absent → false.
+        // "ab" would NOT trigger this — 'b' is only at position 1 in "ab".
+        let mut p1 = HashMap::new();
+        let mut p2 = HashMap::new();
+        p1.insert('a', 0.9);
+        // p1['b'] missing
+        p2.insert('a', 0.1);
+        p2.insert('b', 0.05);
+        let chars: Vec<char> = "ba".chars().collect();
+        assert!(!has_complete_coverage(&chars, &p1, &p2));
     }
 }

@@ -1,10 +1,10 @@
 [package]
 name = "abr-u-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [[bin]]
-name = "abr_u_tokenizer_cli"
+name = "abr_u_tokenizer"
 path = "src/main.rs"
 
 [lib]
