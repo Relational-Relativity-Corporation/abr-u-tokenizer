@@ -47,7 +47,7 @@ fn cmd_stats(args: &[String]) {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Total U units:      {}", vocab.u_unit_count);
     println!("Declared domain:    D_U = {}", vocab.u_unit_count);
-    println!("OOV base ID:        {}", vocab.u_unit_count + 1);
+    println!("Codepoint base ID:  {}", vocab.u_unit_count);
     println!("First 10 units (sorted):");
     let mut units: Vec<(&String, &u32)> = vocab.unit_to_id.iter().collect();
     units.sort_by_key(|(_, &id)| id);
@@ -87,10 +87,10 @@ fn cmd_build_vocab(args: &[String]) {
     let config = serde_json::json!({
         "tokenizer_class": "UTokenizer",
         "model_type": "abr-u-tokenizer",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "vocab_size": vocab.u_unit_count,
         "oov_handling": "option_a_character_fallback",
-        "oov_base_id": vocab.u_unit_count + 1,
+        "codepoint_base_id": vocab.u_unit_count,
         "framework": "ABR/ABRCE V7",
         "provenance": "D_U derived from strict local minima of Q(S) across 317,070 bounded structures",
         "declared_count": 5844
