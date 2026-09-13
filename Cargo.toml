@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "abr_u_tokenizer"
+name = "abr_u_tokenizer_cli"
 path = "src/main.rs"
 
 [lib]
