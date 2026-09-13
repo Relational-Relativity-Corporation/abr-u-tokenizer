@@ -1,18 +1,33 @@
 # abr-u-tokenizer  python/u_tokenizer.py
-# HuggingFace-compatible Python wrapper for the U tokenizer.
+# V0.1.1 — HuggingFace-compatible Python wrapper for the U tokenizer.
 #
-# This wrapper implements the PreTrainedTokenizer interface so the
-# U tokenizer can be dropped in wherever HF tokenizers are used,
-# including with Phi-3 via AutoTokenizer.
+# AUTHORITATIVE IMPLEMENTATION: Rust (src/lib.rs)
+# This Python wrapper re-implements the same declared logic for HF
+# compatibility. It must produce identical output to the Rust core
+# for all inputs. Cross-implementation agreement is tested in
+# tests/test_cross_impl.py.
 #
-# PURE PYTHON IMPLEMENTATION
-# The Rust core is the authoritative implementation. This Python wrapper
-# re-implements the same logic for HF compatibility without requiring
-# a compiled Rust binary at inference time. When the PyO3 binding is
-# available, it will be used instead.
+# COMPLETE TILING (Origin-declared):
+#   Every character in the input stream tiles into the output.
+#   No character is discarded. No position is fabricated.
+#   Spaces tile as codepoint tokens, identical to all other characters.
 #
-# OOV handling: Option A (Origin-declared)
-#   Characters with no P2 data emit as individual character tokens.
+# TOKEN ID SCHEME (V0.1.1 — matches Rust exactly):
+#   0 .. (u_unit_count-1)  — U unit tokens
+#   u_unit_count+          — codepoint tokens: ID = u_unit_count + codepoint
+#   No gap. No phantom [CHAR] marker.
+#
+# DECODE ROUNDTRIP INVARIANT:
+#   decode(encode(S)) == S  for all S.
+#
+# VERIFIER CORRECTIONS FROM V0.1.0:
+#   F1 — has_complete_coverage() checked BEFORE Q(S) computation.
+#        Missing P1 or P2 tiles entire structure character-by-character.
+#        No 0.0 substitution anywhere.
+#   F2 — Full character stream processing. Whitespace tiles as codepoint
+#        tokens. text.split() replaced with character-by-character walk.
+#   F3 — [CHAR] phantom marker removed. Codepoint path is sole OOV
+#        representation. ID = u_unit_count + ord(c), no +1 offset.
 
 import json
 import os
@@ -28,7 +43,7 @@ except ImportError:
 
 class UTokenizer:
     """
-    HuggingFace-compatible U tokenizer.
+    HuggingFace-compatible U tokenizer — V0.1.1.
 
     Tokens are derived from strict local minima of Q(S) across bounded
     structures in the declared corpus. Every token boundary has provenance
@@ -54,13 +69,11 @@ class UTokenizer:
         self.p1_file = p1_file
         self.p2_file = p2_file
 
-        # Load vocabulary
         self._unit_to_id: Dict[str, int] = {}
         self._id_to_unit: Dict[int, str] = {}
         self._load_vocab(vocab_file)
         self._u_unit_count = len(self._unit_to_id)
 
-        # Load participation tables
         self._p1: Dict[str, float] = self._load_participation(p1_file)
         self._p2: Dict[str, float] = self._load_participation(p2_file)
 
@@ -70,11 +83,9 @@ class UTokenizer:
 
     @property
     def vocab_size(self) -> int:
-        """Number of declared U unit tokens (5,844)."""
         return self._u_unit_count
 
     def tokenize(self, text: str) -> List[str]:
-        """Return list of token strings (U units or [OOV:c] markers)."""
         return self._tokenize_to_strings(text)
 
     def encode(
@@ -83,7 +94,6 @@ class UTokenizer:
         add_special_tokens: bool = False,
         **kwargs,
     ) -> List[int]:
-        """Encode text to list of token IDs."""
         return self._encode(text)
 
     def decode(
@@ -92,11 +102,9 @@ class UTokenizer:
         skip_special_tokens: bool = False,
         **kwargs,
     ) -> str:
-        """Decode token IDs back to string."""
         return self._decode(token_ids)
 
     def __call__(self, text, **kwargs):
-        """Minimal __call__ for use with model.generate() pipelines."""
         ids = self._encode(text)
         return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
 
@@ -104,32 +112,26 @@ class UTokenizer:
         return dict(self._unit_to_id)
 
     def convert_tokens_to_ids(self, tokens: List[str]) -> List[int]:
-        return [self._unit_to_id.get(t, self._oov_id('?')) for t in tokens]
+        return [self._unit_to_id.get(t, self._codepoint_id('?')) for t in tokens]
 
     def convert_ids_to_tokens(self, ids: List[int]) -> List[str]:
         return [self._decode_id(i) for i in ids]
 
     def save_pretrained(self, save_directory: str) -> Tuple[str, ...]:
-        """
-        Save tokenizer files compatible with AutoTokenizer.from_pretrained().
-        Writes: vocab.txt, tokenizer_config.json, tokenizer.json
-        """
         os.makedirs(save_directory, exist_ok=True)
 
-        # vocab.txt
         vocab_path = os.path.join(save_directory, "vocab.txt")
         with open(vocab_path, "w", encoding="utf-8") as f:
             for unit, idx in sorted(self._unit_to_id.items(), key=lambda x: x[1]):
                 f.write(f"{idx}\t{unit}\n")
 
-        # tokenizer_config.json
         config = {
             "tokenizer_class": "UTokenizer",
             "model_type": "abr-u-tokenizer",
-            "version": "0.1.0",
+            "version": "0.1.1",
             "vocab_size": self._u_unit_count,
-            "oov_handling": "option_a_character_fallback",
-            "oov_base_id": self._u_unit_count + 1,
+            "tiling": "complete — every character tiles, no discards",
+            "codepoint_base_id": self._u_unit_count,
             "framework": "ABR/ABRCE V7",
             "provenance": (
                 "D_U derived from strict local minima of Q(S) "
@@ -144,14 +146,13 @@ class UTokenizer:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
 
-        # tokenizer.json (minimal HF fast-tokenizer schema)
         tok_json = {
             "version": "1.0",
             "truncation": None,
             "padding": None,
             "added_tokens": [],
             "normalizer": None,
-            "pre_tokenizer": {"type": "Whitespace"},
+            "pre_tokenizer": {"type": "CharacterStream"},
             "post_processor": None,
             "decoder": None,
             "model": {
@@ -167,7 +168,7 @@ class UTokenizer:
         return (vocab_path, config_path, tok_path)
 
     # ─────────────────────────────────────────────────────────────────
-    # Internal implementation
+    # Internal implementation — must match Rust core exactly
     # ─────────────────────────────────────────────────────────────────
 
     def _load_vocab(self, path: str) -> None:
@@ -205,17 +206,37 @@ class UTokenizer:
                         pass
         return table
 
+    def _has_complete_coverage(self, chars: List[str]) -> bool:
+        """
+        F1 FIX: Check complete P1 and P2 coverage before computing Q(S).
+        Q(S)[i] = P1[c_i] + P2[c_{i+1}] for i in 0..len-1.
+        Requires: P1 for chars[0..len-1], P2 for chars[1..len].
+        Returns False if ANY required observation is absent.
+        Absence is NEVER substituted with 0.0.
+        """
+        if len(chars) < 2:
+            return False
+        for i in range(len(chars) - 1):
+            if chars[i] not in self._p1:
+                return False
+            if chars[i + 1] not in self._p2:
+                return False
+        return True
+
     def _compute_q(self, chars: List[str]) -> List[float]:
-        """Q(S)[i] = P1[c_i] + P2[c_{i+1}] for i in 0..len-1."""
+        """
+        Q(S)[i] = P1[c_i] + P2[c_{i+1}].
+        PRECONDITION: _has_complete_coverage(chars) is True.
+        No .get(..., 0.0) — both lookups must be present.
+        """
         q = []
         for i in range(len(chars) - 1):
-            p1_i = self._p1.get(chars[i], 0.0)
-            p2_next = self._p2.get(chars[i + 1], 0.0)
+            p1_i    = self._p1[chars[i]]       # KeyError = precondition violated
+            p2_next = self._p2[chars[i + 1]]   # KeyError = precondition violated
             q.append(p1_i + p2_next)
         return q
 
     def _find_u_boundaries(self, q: List[float]) -> List[int]:
-        """Interior local minima of Q → split positions in char array."""
         boundaries = []
         for i in range(1, len(q) - 1):
             if q[i] < q[i - 1] and q[i] < q[i + 1]:
@@ -235,37 +256,74 @@ class UTokenizer:
             segments.append(chars[:])
         return segments
 
-    def _oov_id(self, c: str) -> int:
-        """Token ID for an OOV character (Option A)."""
-        return self._u_unit_count + 1 + ord(c)
+    def _codepoint_id(self, c: str) -> int:
+        """
+        F3 FIX: Codepoint token ID = u_unit_count + ord(c).
+        No +1 offset. No phantom [CHAR] marker.
+        Matches Rust: char_to_codepoint_id = u_unit_count + (c as u32).
+        """
+        return self._u_unit_count + ord(c)
 
     def _decode_id(self, idx: int) -> str:
+        """
+        F3 FIX: IDs < u_unit_count → U unit string.
+                IDs >= u_unit_count → codepoint: idx - u_unit_count.
+        No [CHAR] branch.
+        """
         if idx < self._u_unit_count:
             return self._id_to_unit.get(idx, f"[UNK:{idx}]")
-        elif idx == self._u_unit_count:
-            return "[CHAR]"
         else:
-            cp = idx - self._u_unit_count - 1
+            cp = idx - self._u_unit_count
             try:
                 return chr(cp)
             except (ValueError, OverflowError):
                 return f"[CP:{cp}]"
 
+    def _encode_structure(self, chars: List[str], out: List[int]) -> None:
+        """
+        Encode a bounded structure (non-whitespace run).
+        F1: coverage checked first — missing P1/P2 → char-by-char, no Q(S).
+        F2: called only for non-whitespace runs; caller handles spaces.
+        """
+        if not chars:
+            return
+        if len(chars) == 1:
+            out.append(self._codepoint_id(chars[0]))
+            return
+        if not self._has_complete_coverage(chars):
+            for c in chars:
+                out.append(self._codepoint_id(c))
+            return
+        q = self._compute_q(chars)
+        boundaries = self._find_u_boundaries(q)
+        segments = self._partition(chars, boundaries)
+        for seg in segments:
+            s = "".join(seg)
+            if s in self._unit_to_id:
+                out.append(self._unit_to_id[s])
+            else:
+                for c in seg:
+                    out.append(self._codepoint_id(c))
+
     def _encode(self, text: str) -> List[int]:
+        """
+        F2 FIX: Walk full character stream. Whitespace tiles as codepoint
+        tokens — never discarded. Bounded structures (non-whitespace runs)
+        processed by _encode_structure.
+        decode(encode(S)) == S for all S.
+        """
         ids: List[int] = []
-        for word in text.split():
-            chars = list(word)
-            q = self._compute_q(chars)
-            boundaries = self._find_u_boundaries(q)
-            segments = self._partition(chars, boundaries)
-            for seg in segments:
-                s = "".join(seg)
-                if s in self._unit_to_id:
-                    ids.append(self._unit_to_id[s])
-                else:
-                    # OOV Option A: character by character
-                    for c in seg:
-                        ids.append(self._oov_id(c))
+        current: List[str] = []
+        for c in text:
+            if c.isspace():
+                if current:
+                    self._encode_structure(current, ids)
+                    current = []
+                ids.append(self._codepoint_id(c))
+            else:
+                current.append(c)
+        if current:
+            self._encode_structure(current, ids)
         return ids
 
     def _decode(self, ids: List[int]) -> str:
@@ -273,8 +331,18 @@ class UTokenizer:
 
     def _tokenize_to_strings(self, text: str) -> List[str]:
         segments: List[str] = []
-        for word in text.split():
-            chars = list(word)
+        current: List[str] = []
+
+        def flush(chars: List[str]) -> None:
+            if not chars:
+                return
+            if len(chars) == 1:
+                segments.append(f"[CP:{chars[0]}]")
+                return
+            if not self._has_complete_coverage(chars):
+                for c in chars:
+                    segments.append(f"[CP:{c}]")
+                return
             q = self._compute_q(chars)
             boundaries = self._find_u_boundaries(q)
             segs = self._partition(chars, boundaries)
@@ -284,5 +352,14 @@ class UTokenizer:
                     segments.append(s)
                 else:
                     for c in seg:
-                        segments.append(f"[OOV:{c}]")
+                        segments.append(f"[CP:{c}]")
+
+        for c in text:
+            if c.isspace():
+                flush(current)
+                current = []
+                segments.append(c)
+            else:
+                current.append(c)
+        flush(current)
         return segments
